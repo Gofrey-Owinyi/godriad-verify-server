@@ -1,75 +1,194 @@
-// GodriadMedia - PAYMENT + SAFARICOM VERIFY SERVER
-// Deploy: Node.js on Render / Railway / Firebase Functions / VPS
-// NEVER put Daraja secret / passkey in the HTML file. Only here, on server, in env vars.
-// Env vars needed: DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_PASSKEY, DARAJA_SHORTCODE, FIREBASE_PROJECT_ID
-// This file does NOT charge anyone by itself. It only VERIFIES after provider callback.
-const express = require('express');
-const app = express();
-app.use(express.json());
 
-// 1. PAYMENT VERIFY - app calls this. Server checks provider, then marks order PAID in Firestore.
-// Replace checkWithProvider() with your real provider (Paystack / Stripe / M-Pesa) API call.
-async function checkWithProvider(orderId){
-  // TODO: call provider API with secret key from env, return true only if provider says PAID
+// GodriadMedia - PAYMENT + SAFARICOM + CLOUDINARY VERIFY SERVER
+// Render: Node.js service
+// Keep all private API secrets in Render Environment Variables.
+// Never put Cloudinary API secrets or payment secrets in frontend code.
+
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+
+// 1. CORS — allow the official GodriadMedia website.
+const ALLOWED_ORIGINS = [
+  'https://godriadmedia.vercel.app'
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+app.use(express.json({ limit: '2mb' }));
+
+// Basic request logging — never log secrets or uploaded files.
+app.use((req, res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.path}`);
+  next();
+});
+
+// 2. Health check
+app.get('/', (req, res) => {
+  res.json({
+    service: 'GodriadMedia Verify Server',
+    status: 'running'
+  });
+});
+
+// 3. PAYMENT VERIFICATION
+async function checkWithProvider(orderId) {
+  // Payment-provider verification is not implemented yet.
+  // Never mark an order paid without checking the real provider.
   return false;
 }
-app.post('/verify', async (req,res)=>{
-  try{
-    const {orderId} = req.body||{};
-    if(!orderId) return res.json({paid:false});
+
+app.post('/verify', async (req, res) => {
+  try {
+    const { orderId } = req.body || {};
+
+    if (!orderId) {
+      return res.status(400).json({ paid: false });
+    }
+
     const paid = await checkWithProvider(orderId);
-    if(paid){
-      // TODO: update Firestore orders/{orderId} -> status='paid', unlock VIP/Boost on server only
-    }
-    return res.json({paid});
-  }catch(e){ return res.json({paid:false, error:e.message}); }
+    return res.json({ paid });
+  } catch (error) {
+    console.error('[PAYMENT VERIFY ERROR]', error.message);
+    return res.status(500).json({ paid: false });
+  }
 });
 
-// 2. SAFARICOM BUNDLE VERIFY - Safaricom calls /daraja-callback, NOT the app.
-// App calls /verify-bundle, server checks if callback already arrived for that checkoutRequestId.
-const verifiedBundles = new Map(); // In production use Firestore, not memory
-app.post('/daraja-callback', (req,res)=>{
-  try{
+// 4. SAFARICOM BUNDLE CALLBACK
+// This temporary Map loses its records when the server restarts.
+// Firestore persistence and callback validation are still required.
+const verifiedBundles = new Map();
+
+app.post('/daraja-callback', (req, res) => {
+  try {
     const stk = req.body?.Body?.stkCallback;
-    if(stk && stk.ResultCode===0){
-      const id = stk.CheckoutRequestID;
-      verifiedBundles.set(id, {delivered:true, amount: stk.CallbackMetadata, time: Date.now()});
-      // TODO: save to Firestore bundles/{id} -> delivered:true
+
+    if (stk && stk.ResultCode === 0 && stk.CheckoutRequestID) {
+      verifiedBundles.set(stk.CheckoutRequestID, {
+        delivered: true,
+        time: Date.now()
+      });
+
+      console.log('[DARAJA] Successful callback received');
     }
-    return res.json({ok:true});
-  }catch(e){ return res.json({ok:false}); }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('[DARAJA CALLBACK ERROR]', error.message);
+    return res.status(500).json({ ok: false });
+  }
 });
-app.post('/verify-bundle', (req,res)=>{
-  const {checkoutRequestId} = req.body||{};
+
+app.post('/verify-bundle', (req, res) => {
+  const { checkoutRequestId } = req.body || {};
+
+  if (!checkoutRequestId) {
+    return res.status(400).json({ delivered: false });
+  }
+
   const found = verifiedBundles.get(checkoutRequestId);
-  return res.json({delivered: !!(found && found.delivered)});
+
+  return res.json({
+    delivered: !!(found && found.delivered)
+  });
 });
 
+// 5. CLOUDINARY SIGNING
+const GM_ALLOWED_PRESETS = [
+  'godriad_profile',
+  'godriad_post',
+  'godriad_reel',
+  'godriad_story'
+];
 
-// 3. CLOUDINARY SIGNING - App asks server for signature, server uses SECRET (never in app)
-// Env: CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_CLOUD_NAME
-// Allowed presets only - prevents someone using your server to sign any preset
-const GM_ALLOWED_PRESETS = ['godriad_profile','godriad_post','godriad_reel','godriad_story'];
 const GM_PRESET_FOLDERS = {
   godriad_profile: 'godriadmedia/profile-photos',
   godriad_post: 'godriadmedia/post-images',
   godriad_reel: 'godriadmedia/videos',
   godriad_story: 'godriadmedia/stories'
 };
-app.post('/sign-cloudinary', (req,res)=>{
-  try{
-    const {preset} = req.body||{};
-    if(!GM_ALLOWED_PRESETS.includes(preset)) return res.json({error:'preset not allowed'});
-    const timestamp = Math.floor(Date.now()/1000);
+
+app.post('/sign-cloudinary', (req, res) => {
+  try {
+    const {
+      CLOUDINARY_API_KEY,
+      CLOUDINARY_API_SECRET,
+      CLOUDINARY_CLOUD_NAME
+    } = process.env;
+
+    if (
+      !CLOUDINARY_API_KEY ||
+      !CLOUDINARY_API_SECRET ||
+      !CLOUDINARY_CLOUD_NAME
+    ) {
+      console.error('[CLOUDINARY] Required environment variables missing');
+
+      return res.status(503).json({
+        error: 'Cloudinary server configuration is incomplete'
+      });
+    }
+
+    const { preset } = req.body || {};
+
+    if (!GM_ALLOWED_PRESETS.includes(preset)) {
+      return res.status(400).json({
+        error: 'Preset not allowed'
+      });
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
     const folder = GM_PRESET_FOLDERS[preset];
-    // Signature = SHA1(timestamp + folder + preset + secret) - Cloudinary format
-    // We use Node crypto, no cloudinary SDK needed for signing
-    const crypto = require('crypto');
-    const toSign = `folder=${folder}&timestamp=${timestamp}&upload_preset=${preset}${process.env.CLOUDINARY_API_SECRET}`;
-    const signature = crypto.createHash('sha1').update(toSign).digest('hex');
-    return res.json({timestamp, signature, api_key: process.env.CLOUDINARY_API_KEY, folder, cloud_name: process.env.CLOUDINARY_CLOUD_NAME});
-  }catch(e){ return res.json({error:e.message}); }
+
+    // Parameters are signed in alphabetical order.
+    const toSign =
+      `folder=${folder}` +
+      `&timestamp=${timestamp}` +
+      `&upload_preset=${preset}`;
+
+    const signature = crypto
+      .createHash('sha1')
+      .update(toSign + CLOUDINARY_API_SECRET)
+      .digest('hex');
+
+    console.log(`[CLOUDINARY] Signature created for ${preset}`);
+
+    return res.json({
+      timestamp,
+      signature,
+      api_key: CLOUDINARY_API_KEY,
+      folder,
+      cloud_name: CLOUDINARY_CLOUD_NAME
+    });
+
+  } catch (error) {
+    console.error('[CLOUDINARY SIGN ERROR]', error.message);
+
+    return res.status(500).json({
+      error: 'Unable to create Cloudinary signature'
+    });
+  }
 });
 
-const PORT = process.env.PORT||3000;
-app.listen(PORT, ()=>console.log('Godriad verify server on '+PORT));
+// 6. START SERVER
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log('Godriad verify server on ' + PORT);
+});
